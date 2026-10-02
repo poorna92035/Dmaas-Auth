@@ -1,0 +1,223 @@
+name: Auth Component CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: auth-service
+  ECS_CLUSTER: auth-cluster
+  ECS_SERVICE: auth-service
+  ECS_TASK_DEFINITION: ecs-task-definition.json
+  CONTAINER_NAME: auth-service
+
+jobs:
+
+################################################################################
+# Validate + Unit Tests
+################################################################################
+
+  validate-unit-tests:
+    name: Validate and Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Setup Runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate and Run Tests
+        run: |
+          npm ci
+          npm ci --dry-run
+          npm test -- --coverage
+
+################################################################################
+# Security Scan
+################################################################################
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: validate-unit-tests
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Dependency Audit
+        run: |
+          npm ci
+          npm audit --audit-level=high
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          output-file: sbom.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-report
+          path: sbom.json
+
+################################################################################
+# Build Lambda / Container Artifact
+################################################################################
+
+  build-artifact:
+    name: Build Lambda Container Artifact
+    runs-on: ubuntu-latest
+    needs: security-scan
+
+    outputs:
+      image_tag: ${{ github.sha }}
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      ##########################################################################
+      # Lambda Package
+      ##########################################################################
+
+      - name: Build Lambda Package
+        run: |
+          npm ci
+          mkdir -p artifacts
+          zip -r artifacts/auth-lambda.zip .
+
+      - name: Upload Lambda Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-package
+          path: artifacts/auth-lambda.zip
+
+      ##########################################################################
+      # Docker Image
+      ##########################################################################
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+            -t ${CONTAINER_NAME}:${{ github.sha }} \
+            -f Dockerfile .
+
+################################################################################
+# Publish Artifact
+################################################################################
+
+  publish-artifact:
+    name: Publish Artifact
+    runs-on: ubuntu-latest
+    needs: build-artifact
+
+    outputs:
+      image_uri: ${{ steps.export.outputs.image_uri }}
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login To Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+            -t ${CONTAINER_NAME}:${{ github.sha }} \
+            -f Dockerfile .
+
+      - name: Tag Image
+        run: |
+          docker tag \
+          ${CONTAINER_NAME}:${{ github.sha }} \
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Push Image
+        run: |
+          docker push \
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Export Image URI
+        id: export
+        run: |
+          echo "image_uri=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+################################################################################
+# Deploy Auth Component
+################################################################################
+
+  deploy-auth:
+    name: Deploy Auth Component
+    runs-on: ubuntu-latest
+    needs: publish-artifact
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update Task Definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.publish-artifact.outputs.image_uri }}
+
+      - name: Deploy ECS Service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
+
+################################################################################
+# Smoke Test
+################################################################################
+
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: deploy-auth
+
+    steps:
+      - name: Health Check
+        run: |
+          APP_URL=https://your-auth-endpoint/health
+
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$APP_URL")
+
+          if [ "$STATUS" != "200" ]; then
+            echo "Smoke Test Failed"
+            exit 1
+          fi
+
+          echo "Smoke Test Passed"
